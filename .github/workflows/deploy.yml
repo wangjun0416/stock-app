@@ -1,0 +1,158 @@
+name: Deploy Stock Monitor to Server
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        
+    - name: Install dependencies
+      run: npm ci
+      
+    - name: Build frontend
+      run: npm run build
+      
+    - name: Create deployment package
+      run: |
+        mkdir -p deploy
+        cp -r build deploy/
+        cp server.js deploy/
+        cp package*.json deploy/
+        cp start.sh deploy/ 2>/dev/null || true
+        tar -czf deploy.tar.gz deploy/
+        
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: deployment-package
+        path: deploy.tar.gz
+        retention-days: 5
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    steps:
+    - name: Download artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: deployment-package
+        
+    - name: Deploy to server via SSH
+      env:
+        SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+        SSH_HOST: ${{ secrets.SSH_HOST }}
+        SSH_USER: ${{ secrets.SSH_USER }}
+        SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+      run: |
+        if [ -z "$SSH_PRIVATE_KEY" ] || [ -z "$SSH_HOST" ] || [ -z "$SSH_USER" ]; then
+          echo "⚠️  SSH credentials not configured. Skipping deployment."
+          echo "Set SSH_PRIVATE_KEY, SSH_HOST, and SSH_USER secrets to enable automatic deployment."
+          exit 0
+        fi
+        
+        echo "🚀 Deploying to server..."
+        
+        # Setup SSH
+        mkdir -p ~/.ssh
+        echo "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        cat >> ~/.ssh/config << EOF
+        Host deploy-server
+          HostName $SSH_HOST
+          User $SSH_USER
+          Port $SSH_PORT
+          IdentityFile ~/.ssh/deploy_key
+          StrictHostKeyChecking no
+        EOF
+        chmod 600 ~/.ssh/config
+        
+        # Upload files
+        scp -F ~/.ssh/config deploy.tar.gz deploy-server:/tmp/
+        
+        # Deploy on server
+        ssh -F ~/.ssh/config deploy-server << 'DEPLOY_SCRIPT'
+          # Create app directory
+          mkdir -p ~/stock-monitor
+          cd ~/stock-monitor
+          
+          # Backup current version
+          if [ -d build ]; then
+            mv build build.backup.$(date +%Y%m%d_%H%M%S)
+          fi
+          
+          # Extract new version
+          tar -xzf /tmp/deploy.tar.gz -C /tmp/
+          cp -r /tmp/deploy/* .
+          rm -rf /tmp/deploy /tmp/deploy.tar.gz
+          
+          # Install dependencies
+          npm ci --production
+          
+          # Install serve globally if not present
+          if ! command -v serve &> /dev/null; then
+            npm install -g serve
+          fi
+          
+          # Stop existing processes
+          pkill -f "node server.js" || true
+          pkill -f "serve -s build" || true
+          sleep 2
+          
+          # Start backend
+          nohup node server.js > server.log 2>&1 &
+          echo $! > server.pid
+          
+          # Wait for backend
+          sleep 5
+          
+          # Check backend health
+          if curl -s http://localhost:3001/api/health > /dev/null; then
+            echo "✅ Backend started successfully"
+          else
+            echo "❌ Backend failed to start"
+            cat server.log
+            exit 1
+          fi
+          
+          # Start frontend
+          nohup serve -s build -l 3000 > frontend.log 2>&1 &
+          echo $! > frontend.pid
+          
+          # Wait for frontend
+          sleep 3
+          
+          # Check frontend
+          if curl -s http://localhost:3000 > /dev/null; then
+            echo "✅ Frontend started successfully"
+          else
+            echo "❌ Frontend failed to start"
+            cat frontend.log
+            exit 1
+          fi
+          
+          echo ""
+          echo "========================================"
+          echo "🎉 Deployment successful!"
+          echo ""
+          echo "📊 Access URLs:"
+          echo "   Frontend: http://$(hostname -I | awk '{print $1}'):3000"
+          echo "   Backend:  http://$(hostname -I | awk '{print $1}'):3001"
+          echo "========================================"
+        DEPLOY_SCRIPT
+        
+        echo "✅ Deployment completed!"

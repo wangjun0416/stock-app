@@ -1,0 +1,124 @@
+name: Run Stock Monitor on GitHub Actions Runner
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Run every 6 hours to keep the service alive
+    - cron: '0 */6 * * *'
+
+# Important: This will run for up to 6 hours (GitHub Actions limit)
+# For production, use your own server or cloud VM
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours max
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        
+    - name: Install dependencies
+      run: npm ci
+      
+    - name: Build frontend
+      run: npm run build
+      
+    - name: Install serve
+      run: npm install -g serve
+      
+    - name: Start services with ngrok tunnel
+      env:
+        NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+      run: |
+        # Install ngrok for public tunnel
+        curl -s https://ngrok-agent.s3.amazonaws.com/ngrok.asc | sudo tee /etc/apt/trusted.gpg.d/ngrok.asc >/dev/null
+        echo "deb https://ngrok-agent.s3.amazonaws.com buster main" | sudo tee /etc/apt/sources.list.d/ngrok.list
+        sudo apt update && sudo apt install ngrok
+        
+        # Configure ngrok
+        ngrok config add-authtoken $NGROK_AUTHTOKEN
+        
+        # Start backend
+        echo "🚀 Starting backend..."
+        node server.js &
+        BACKEND_PID=$!
+        
+        # Wait for backend
+        sleep 5
+        
+        # Check backend
+        if ! curl -s http://localhost:3001/api/health > /dev/null; then
+          echo "❌ Backend failed to start"
+          exit 1
+        fi
+        echo "✅ Backend running on port 3001"
+        
+        # Start frontend
+        echo "🚀 Starting frontend..."
+        serve -s build -l 3000 &
+        FRONTEND_PID=$!
+        
+        # Wait for frontend
+        sleep 3
+        
+        # Check frontend
+        if ! curl -s http://localhost:3000 > /dev/null; then
+          echo "❌ Frontend failed to start"
+          exit 1
+        fi
+        echo "✅ Frontend running on port 3000"
+        
+        # Start ngrok tunnel for frontend
+        ngrok http 3000 --log=stdout &
+        NGROK_PID=$!
+        
+        # Wait for ngrok to start
+        sleep 5
+        
+        # Get ngrok public URL
+        NGROK_URL=$(curl -s http://localhost:4040/api/tunnels | grep -o '"public_url":"https://[^"]*' | grep -o 'https://[^"]*' | head -1)
+        
+        echo ""
+        echo "========================================"
+        echo "🎉 Application is running!"
+        echo ""
+        echo "🔗 Public URLs:"
+        if [ -n "$NGROK_URL" ]; then
+          echo "   Frontend: $NGROK_URL"
+        else
+          echo "   Frontend: http://localhost:3000 (local only)"
+        fi
+        echo "   Backend:  http://localhost:3001"
+        echo "   Health:   http://localhost:3001/api/health"
+        echo ""
+        echo "⏱️  This runner will be active for up to 6 hours"
+        echo "========================================"
+        
+        # Keep running
+        echo "Keeping services alive..."
+        COUNTER=0
+        while [ $COUNTER -lt 360 ]; do  # 6 hours = 360 x 1 minute
+          sleep 60
+          COUNTER=$((COUNTER + 1))
+          
+          # Health check
+          if ! curl -s http://localhost:3001/api/health > /dev/null; then
+            echo "❌ Health check failed at $(date)"
+            break
+          fi
+          
+          # Print status every 5 minutes
+          if [ $((COUNTER % 5)) -eq 0 ]; then
+            echo "✅ Still running... (${COUNTER} minutes elapsed)"
+          fi
+        done
+        
+        echo "⏹️  Shutting down..."
+        kill $BACKEND_PID $FRONTEND_PID $NGROK_PID 2>/dev/null || true
