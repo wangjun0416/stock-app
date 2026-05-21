@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  stock-monitor:
+    build: .
+    container_name: stock-monitor
+    ports:
+      - "3000:3000"  # Frontend
+      - "3001:3001"  # Backend API
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - stock-network
+
+networks:
+  stock-network:
+    driver: bridge
